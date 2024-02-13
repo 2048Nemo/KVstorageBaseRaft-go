@@ -3,7 +3,6 @@ package main
 import (
 	"fmt"
 	"math/rand"
-	"net/rpc"
 	"sync"
 	"time"
 )
@@ -25,16 +24,16 @@ const (
 //
 // 要理解为什么raft 结构体需要这个属性以及方法
 type Raft struct {
-	mu        sync.Mutex    // 锁
-	peers     []*rpc.Client // 所用成员的通讯信息
-	persister *Persister    // 持久化信息
-	me        int           // 本节点在成员通讯信息的index
+	mu        sync.Mutex // 锁
+	peers     []*Raft    // 所用成员的通讯信息
+	persister *Persister // 持久化信息
+	me        int        // 本节点在成员通讯信息的index
 
 	//Persistent state on all servers
 	//所有服务器都有的持久性状态（在响应RPC请求之前必须先保存状态）
-	CurrentTerm int        // 目前的Term(初始值为0，单调增加)
-	VotedFor    int        // 当前term 内获得投票的候选人的ID（没有则为0）
-	Log         []LogEntry //log信息:对于每个状态机而言：每个在任期内从leader发送过来的日志包含命令（日志的第一个索引号是 1 ）
+	CurrentTerm int         // 目前的Term(初始值为0，单调增加)
+	VotedFor    int         // 当前term 内获得投票的候选人的ID（没有则为-1）
+	Log         []*LogEntry //log信息:对于每个状态机而言：每个在任期内从leader发送过来的日志包含命令（日志的第一个索引号是 1 ）
 
 	// Volatile state on all servers
 	// 所有服务器都有的易失性状态
@@ -114,12 +113,12 @@ type AppendEntriesReply struct {
 }
 
 type AppendEntriesArgs struct {
-	Term         int        //current Term
-	LeaderID     int        // LeaderID
-	PreLogIndex  int        //index of log entry immediately preceding new ones
-	PreLogTerm   int        //term of prevLogIndex entry
-	LogEntries   []LogEntry //log entries to store, request is heart beat if it's empty
-	LeaderCommit int        //leader’s CommitIndex
+	Term         int         //current Term
+	LeaderID     int         // LeaderID
+	PreLogIndex  int         //index of log entry immediately preceding new ones
+	PreLogTerm   int         //term of prevLogIndex entry
+	LogEntries   []*LogEntry //log entries to store, request is heart beat if it's empty
+	LeaderCommit int         //leader’s CommitIndex
 }
 
 // 主要作用是Leader向Follower添加Entry到Follower的日志当中，或者发送心跳包。在返回的reply中，Follower需要返回的当前的Term，出否成功等信息。
@@ -173,7 +172,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		for ; i < len(args.LogEntries)+args.PreLogIndex && i <= len(rf.Log); i++ {
 			if rf.Log[i].Index == args.LogEntries[i-args.PreLogIndex].Index && rf.Log[i].Term != args.LogEntries[i-args.PreLogIndex].Term {
 				//冲突存在的话就以leader发送过来的为准
-				rf.Log[i] = args.LogEntries[i-args.PreLogIndex]
+				*rf.Log[i] = *args.LogEntries[i-args.PreLogIndex]
 				rf.nextIndex[rf.me] = rf.Log[i].Index + 1
 				rf.matchIndex[rf.me] = rf.Log[i].Index
 			}
@@ -209,6 +208,7 @@ type RequestVoteArgs struct {
 	LastLogTerm  int //term of candidate's last log entry
 }
 
+//选举
 //发送方(Candidate)：
 //- 增加currentTerm
 //- 自己先投自己一票
@@ -281,8 +281,63 @@ func (rf *Raft) doElection() {
 	return
 }
 
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
+// 如果args.Term < currentTerm, 返回false
+// - 如果args.Term > currentTerm, currentTerm = args.Term，改变角色为Follower。如果
+// - 如果votedFor为空或者有candidateID，并且候选人的日志至少与接收者的日志一样新，投赞成票并刷新计时器。至少一样新是指：
+//
+//	args.LastLogIndex > my.LastLogIndex || (args.LastLogIndex == my.LastLogIndex && LastLogTerm >= Log[LastLogIndex].Term)
+func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) bool {
+	rf.mu.Lock()
+	//先持久化在解锁
+	defer rf.persist()
+	defer rf.mu.Unlock()
 
+	//分三种情况讨论args term 和currentTerm 的关系
+	//第一种： args 的term选主慢了，网络分区已经完成了选主
+	if args.Term < rf.CurrentTerm {
+		reply.Term = rf.CurrentTerm
+		reply.VoteGranted = false
+		reply.ok = false
+		return false
+	}
+	if args.Term > rf.CurrentTerm {
+		//第二种：args发送过来请求投票,如果任何时候rpc请求或者响应的term大于自己的term，更新term，并变成follower
+		rf.CurrentTerm = args.Term
+		rf.Character = Follower
+		rf.VotedFor = -1
+		//	重置定时器：收到leader的ae，开始选举，透出票
+		//这时候更新了term之后，votedFor也要置为-1
+	}
+	if rf.CurrentTerm == args.Term {
+		fmt.Errorf("[func--rf{%d}] 前面校验过args.Term==rf.currentTerm，这里却不等", rf.me)
+	}
+	//	现在节点任期都是相同的(任期小的也已经更新到新的args的term了)
+	//	，要检查log的term和index是不是匹配的了
+	//1.如果投票者自己的日志比候选人的日志更新，则投票者会拒绝投票。
+	//2.（“更新”的定义：）如果日志的最后一个entry具有不同的term ，则具有较晚term的日志是更加新的。如果日志以相同的term结尾，则较长的日志是更加新的。
+	//3.如果投票者的日志没有leader的新的话就会接受leader的日志
+
+	if !(args.LastLogIndex > rf.getLastLogIndex() || (args.LastLogIndex == rf.getLastLogIndex() && args.LastLogTerm >= rf.getLastLogTerm())) {
+		//先排除不符合投票条件的candidate发送过来请求
+		reply.Term = rf.CurrentTerm
+		reply.VoteGranted = false
+		reply.ok = false
+		//这里返回false 和true 是瞎写的，因为这个是本地调用基本上不会出现调用失败的情况，这个函数返回值仅仅是rpc函数前的测试而已
+		return true
+	}
+	//同时收到多个选举投票请求时（但是票已经投出去了）
+	if rf.VotedFor != -1 && args.CandidateID != rf.VotedFor {
+		reply.Term = rf.CurrentTerm
+		reply.VoteGranted = false
+		reply.ok = false
+		return true
+	} else {
+		//第一次接收到投票请求或者是重复接收到投票请求（网络故障导致candidate没有收到reply的信息,注意由于上面条件的过滤，集群中能到这边的重复请求只能是最新candidate发送过来的重复请求）
+		reply.Term = rf.CurrentTerm
+		reply.VoteGranted = true
+		reply.ok = true
+		return true
+	}
 }
 
 func (rf *Raft) getLastLogIndexAndTerm(longIndex *int, term *int) {
@@ -295,6 +350,12 @@ func (rf *Raft) getLastLogIndexAndTerm(longIndex *int, term *int) {
 	}
 
 	return
+}
+func (rf *Raft) getLastLogTerm() int {
+	lastLogIndex := -1
+	term := -1
+	rf.getLastLogIndexAndTerm(&lastLogIndex, &term)
+	return term
 }
 
 func (rf *Raft) getLastLogIndex() int {
@@ -311,10 +372,12 @@ func (rf *Raft) sendRequestVote(serverIdx int, args *RequestVoteArgs, reply *Req
 
 	start := time.Now()
 	fmt.Printf("[func-sendRequestVote {%d}] 向server{%d} 发送 RequestVote 开始", rf.me, rf.CurrentTerm, rf.getLastLogIndex())
-	ok := rf.peers[serverIdx].Call("RequestVote", args, reply)
+	//ok := rf.peers[serverIdx].Call("RequestVote", args, reply)
+	//todo 暂时没有用rpc先用本地方法测试一下
+	ok := rf.peers[serverIdx].RequestVote(args, reply)
 	fmt.Printf("[func-sendRequestVote {%d}] 向server{%d} 发送 RequestVote 结束，耗时:{%v} ms", rf.me, rf.CurrentTerm, rf.getLastLogIndex(), time.Now().Sub(start))
 
-	if ok != nil {
+	if !ok {
 		fmt.Printf("RequestVote to server %d failed at %s\n", serverIdx, start.String())
 		return false
 	}
@@ -322,6 +385,7 @@ func (rf *Raft) sendRequestVote(serverIdx int, args *RequestVoteArgs, reply *Req
 	//调用rpc成功说明这次调用网络畅通
 	//由于是service端并发的rpc调用所以要加个锁进行同步
 	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	//对回应进行处理，要记得无论什么时候收到回复就要检查term
 	if reply.Term < rf.CurrentTerm {
 		//尴尬了别人term大说明集群已经完成选leader了，身份应该从candidate转变为follower
@@ -374,5 +438,82 @@ func (rf *Raft) persist() {
 }
 
 func (rf *Raft) doHeartBeat() {
+	//先加锁
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
+	if rf.Character == Leader {
+		//向除了自己以外的所有节点发送消息appendEntry消息
+		fmt.Printf("[func-Raft::doHeartBeat()-Leader: {%d}] Leader的心跳定时器触发了\n", rf.me)
+
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				continue
+			}
+			fmt.Printf("[func-Raft::doHeartBeat()-Leader: {%d}] Leader的心跳定时器触发了 index:{%d}\n", rf.me, i)
+			if rf.nextIndex[i] >= 1 {
+				fmt.Errorf("rf.nextIndex[%d] = {%d}", i, rf.nextIndex[i])
+				return
+			}
+
+			//比快照索引小则发送快照
+			//日志压缩加入后要判断是发送快照还是发送AE
+			//注意这里是小于等于后面getPreLogIndex条件会依赖 这个条件
+			if rf.nextIndex[i] <= rf.PrevSnapIndex {
+				go rf.leaderSendSnapShot()
+				continue
+			}
+
+			//这两个变量是专门计算将要发送的appendEntries需要的参数
+			entryPreLogIndex := -1
+			entryPreLogTerm := -1
+			//这个本质上就是跟据follower的nextindex计算出来项目中的接下来要发送的ae信息
+			rf.getPreLogInfo(i, &entryPreLogIndex, &entryPreLogTerm)
+			//发送ae，先生成appendEntry实体 和 appendEntryReply
+
+			//生成logEntries 由nextIndex【server】记录的index -1开始复制到末尾
+			logEntries := make([]*LogEntry, len(rf.Log)-int(entryPreLogIndex)-1)
+			copy(logEntries, rf.Log[1+entryPreLogIndex:])
+			appendEntriesArgs := &AppendEntriesArgs{
+				Term:         rf.CurrentTerm,
+				LeaderID:     rf.me,
+				PreLogIndex:  entryPreLogIndex,
+				PreLogTerm:   entryPreLogTerm,
+				LogEntries:   logEntries,
+				LeaderCommit: rf.CommitIndex,
+			}
+
+			appendEntriesReply := &AppendEntriesReply{
+				Term:          0,
+				Success:       false,
+				isOk:          false,
+				ConflictIndex: 0,
+				ConflictTerm:  0,
+			}
+
+			rf.AppendEntries(appendEntriesArgs, appendEntriesReply)
+
+		}
+	}
+}
+
+func (rf *Raft) sendHeartBeat() {
+
+}
+
+func (rf *Raft) leaderSendSnapShot() {
+
+}
+
+func (rf *Raft) getPreLogInfo(server int, entryPreLogIndex *int, entryPreLogTerm *int) {
+	//logs长度为0返回0,0，不是0就根据nextIndex数组的数值返回
+	if rf.nextIndex[server] == rf.PrevSnapIndex+1 {
+		//有现成的快照索引于是直接返回便是
+		*entryPreLogIndex = rf.PrevSnapIndex
+		*entryPreLogTerm = rf.PrevSnapTerm
+		return
+	}
+	nextidx := rf.nextIndex[server]
+	*entryPreLogIndex = nextidx - 1
+	*entryPreLogTerm = rf.Log[nextidx].Term
 }
