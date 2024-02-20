@@ -26,6 +26,8 @@ const (
 //
 // 要理解为什么raft 结构体需要这个属性以及方法
 type Raft struct {
+	UnimplementedRaftKVServer
+
 	mu sync.Mutex // 锁
 
 	// peers record the index of client
@@ -70,10 +72,10 @@ type Raft struct {
 
 // 与外界传输信息的结构
 type ApplyMsg struct {
-	Index       int
-	Command     interface{}
-	UseSnapshot bool // True安装快照 False为普通请求
-	Snapshot    []byte
+	Op    string
+	Key   string
+	Value int32
+	Index int
 }
 
 // Raft 对外提供的接口
@@ -148,60 +150,86 @@ func (rf *Raft) ticker() {
 // - 如果Success为false，将这个Follower的nextIndex进行减一。如果为true，那么就把这个Follower的nextIndex值加(nextIndex[FollowerID] += len(args.LogEntries))
 // - 达成一致后选取达成一致(quorum)的index置为commitIndex
 
-func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+func (rf *Raft) AppendEntries(ctx context.Context, args *AppendEntriesArgs) (*AppendEntriesReply, error) {
+	reply := &AppendEntriesReply{}
+	reply.Term = int64(rf.CurrentTerm)
+	reply.Success = false
+
 	//判断方法调用方是否是leader（某些情况下服务器故障会导致集群重新选举，而老的leader并不知情，会再次调用这个方法意图恢复心跳检测或者追加日志操作，但是这个返回结果会告诉调用方自己已经不是leader了，从而使调用方回退到follower角色）
 	if rf.CurrentTerm > int(args.Term) {
-		reply.Success = false
+		return reply, nil
+	}
+	if rf.CurrentTerm < int(args.Term) {
+		reply.Term = args.Term
+		//更新leader的term
+		rf.CurrentTerm = int(args.Term)
 	}
 	//现任当前term leader 调用要求追加日志
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	//更新leader的term
-	rf.CurrentTerm = int(args.Term)
-	//一定要先回退到character follower 角色，因为我写的定时器刷星机制是和角色挂钩的
-	rf.Character = Follower
-	//刷新定时器
-	rf.ResetTimer()
 
 	//如果日志中preLogIndex的Term与PreLogTerm不一样，Success为false(if Log[preLogIndex].Term == PreLogTerm)
-	//必须要prelogindex必须要大于传入的prelogindex 否则的话让leader重传更小的
-	if len(rf.Log) >= int(args.PrevLogIndex) && rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		reply.Term = int64(rf.CurrentTerm)
+	//prelogindex必须要大于传入的prelogindex 否则的话让leader重传更小的,到这里的条件就是preLogIndex <= args.preLogIndex
+	if len(rf.Log) <= int(args.PrevLogIndex) {
 		reply.Success = false
-		return
+		return reply, nil
 	}
+	//并且要保证相同的index中与传递过来的prelogterm相等
+	if args.PrevLogIndex >= 0 && rf.Log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		return reply, nil
+	}
+
 	//如果日志中preLogIndex的Term与PreLogTerm一样，Success为true
 	reply.Success = true
 	reply.Term = int64(rf.CurrentTerm)
 
 	//如果是心跳检测的话那将没有log entry
-	if len(args.Entries) != 0 {
-		//检测冲突(相同的index 但是却是不同的term) ,并解决冲突
-		i := args.PrevLogIndex
-		for ; i < len(args.LogEntries)+args.PreLogIndex && i <= len(rf.Log); i++ {
-			if rf.Log[i].Index == args.LogEntries[i-args.PreLogIndex].Index && rf.Log[i].Term != args.LogEntries[i-args.PreLogIndex].Term {
-				//冲突存在的话就以leader发送过来的为准
-				*rf.Log[i] = *args.LogEntries[i-args.PreLogIndex]
-				rf.nextIndex[rf.me] = rf.Log[i].Index + 1
-				rf.matchIndex[rf.me] = rf.Log[i].Index
-			}
+	if len(args.Entries) == 0 {
+		//收到心跳检测，刷新定时器
+		fmt.Printf("[Node %v].%v receive a empty Entry from %v", rf.me, rf.Character, args.GetLeaderId())
+		//一定要先回退到character follower 角色，因为我写的定时器刷星机制是和角色挂钩的
+		rf.Character = Follower
+		//刷新定时器
+		rf.ResetTimer()
+		//心跳检测刷新定时后进行同步leader 发过来得commitindex
+		if int(args.LeaderCommit) > rf.CommitIndex {
+			fmt.Printf("[Node %v] receive a LEADERCOMMIT %v ", rf.me, args.GetLeaderCommit())
+			rf.CommitIndex = min(int(args.LeaderCommit), rf.CommitIndex)
+			fmt.Printf("[Node %v] update its commitIndex to %v ", rf.me, rf.CommitIndex)
 		}
-		//append 新添加的日志
-		for ; i < len(args.LogEntries)+args.PreLogIndex; i++ {
-			rf.Log = append(rf.Log, args.LogEntries[i])
-			rf.nextIndex[rf.me] = rf.Log[i].Index + 1
-			rf.matchIndex[rf.me] = rf.Log[i].Index
-		}
+		return reply, nil
 	}
 
-	//复制从leader 发来的log 后再更新已提交信息
-	// LeaderCommit > commitIndex,将commitIndex = min(leaderCommit, 最新日志项index)
-
-	if args.LeaderCommit > rf.CommitIndex {
-		rf.CommitIndex = min(args.LeaderCommit, rf.matchIndex[rf.me])
+	// 标准的raft算法中其实是有日志冲突检测的，这里暂时没有实现，前面已经，检测冲突(相同的index 但是却是不同的term) ,并解决冲突
+	//i := args.PrevLogIndex
+	//for ; i < len(args.Entries)+args.PrevLogIndex && i <= len(rf.Log); i++ {
+	//	if rf.Log[i].Index == args.LogEntries[i-args.PreLogIndex].Index && rf.Log[i].Term != args.LogEntries[i-args.PreLogIndex].Term {
+	//		//冲突存在的话就以leader发送过来的为准
+	//		*rf.Log[i] = *args.LogEntries[i-args.PreLogIndex]
+	//		rf.nextIndex[rf.me] = rf.Log[i].Index + 1
+	//		rf.matchIndex[rf.me] = rf.Log[i].Index
+	//	}
+	//}
+	////append 新添加的日志
+	//for ; i < len(args.LogEntries)+args.PreLogIndex; i++ {
+	//	rf.Log = append(rf.Log, args.LogEntries[i])
+	//	rf.nextIndex[rf.me] = rf.Log[i].Index + 1
+	//	rf.matchIndex[rf.me] = rf.Log[i].Index
+	//}
+	rf.Character = Follower
+	rf.ResetTimer()
+	fmt.Printf("[Node %v] receive appendentries with entry %+v. And currentTerm is %v, logs len is %v, committedIndex is: %v", rf.me, args.Entries[0], rf.CurrentTerm, len(rf.Log), rf.CommitIndex)
+	rf.Log = rf.Log[:args.PrevLogIndex+1]
+	rf.Log = append(rf.Log, args.Entries...)
+	//debug.Dlog("[Node %v]'s loglen is %v after append", rf.me, len(rf.logs))
+	if int(args.GetLeaderCommit()) > rf.CommitIndex {
+		fmt.Printf("[Node %v]'s commit Index is less then Leader's", rf.me)
+		rf.CommitIndex = min(int(args.LeaderCommit), rf.CommitIndex)
+		rf.apply()
 	}
-
-	return
+	fmt.Printf("[Node %v]'s lastapplied log is %+v ,commited Index is %v", rf.me, rf.Log[rf.CommitIndex], rf.CommitIndex)
+	reply.Success = true
+	return reply, nil
 }
 
 //选举
@@ -319,58 +347,48 @@ func (rf *Raft) doElection() {
 // - 如果votedFor为空或者有candidateID，并且候选人的日志至少与接收者的日志一样新，投赞成票并刷新计时器。至少一样新是指：
 //
 //	args.LastLogIndex > my.LastLogIndex || (args.LastLogIndex == my.LastLogIndex && LastLogTerm >= Log[LastLogIndex].Term)
-func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) bool {
+func (rf *Raft) RequestVoteRequestVote(ctx context.Context, args *RequestVoteArgs) (reply *RequestVoteReply, err error) {
 	rf.mu.Lock()
-	//先持久化在解锁
-	defer rf.persist()
 	defer rf.mu.Unlock()
 
-	//分三种情况讨论args term 和currentTerm 的关系
+	reply.Term = int64(rf.CurrentTerm)
+	// Default not to vote
+	reply.VoteGranted = false
+
+	//分三种情况讨论不满足投票的条件
 	//第一种： args 的term选主慢了，网络分区已经完成了选主
-	if args.Term < rf.CurrentTerm {
-		reply.Term = rf.CurrentTerm
-		reply.VoteGranted = false
-		reply.ok = false
-		return false
+	//第二种： 相同term，但是却因为网络原因已经投过票了
+	//第三种： leader传递过来的日志更旧
+	if rf.CurrentTerm > int(args.GetTerm()) || (rf.CurrentTerm == int(args.GetTerm()) && rf.VotedFor != -1 && int64(rf.VotedFor) != args.GetCandidateId()) || !rf.isLogUptoDate(int(args.LastLogIndex), int(args.LastLogTerm)) {
+		// has voted to another Candidate
+		fmt.Printf("[Node %v] DO NOT vote to %v, rf.votedFor is %v", rf.me, args.CandidateId, rf.VotedFor)
+		return reply, nil
 	}
-	if args.Term > rf.CurrentTerm {
-		//第二种：args发送过来请求投票,如果任何时候rpc请求或者响应的term大于自己的term，更新term，并变成follower
-		rf.CurrentTerm = args.Term
-		rf.Character = Follower
-		rf.VotedFor = -1
-		//	重置定时器：收到leader的ae，开始选举，透出票
-		//这时候更新了term之后，votedFor也要置为-1
-	}
-	if rf.CurrentTerm == args.Term {
-		fmt.Errorf("[func--rf{%d}] 前面校验过args.Term==rf.currentTerm，这里却不等", rf.me)
-	}
+
 	//	现在节点任期都是相同的(任期小的也已经更新到新的args的term了)
 	//	，要检查log的term和index是不是匹配的了
 	//1.如果投票者自己的日志比候选人的日志更新，则投票者会拒绝投票。
 	//2.（“更新”的定义：）如果日志的最后一个entry具有不同的term ，则具有较晚term的日志是更加新的。如果日志以相同的term结尾，则较长的日志是更加新的。
 	//3.如果投票者的日志没有leader的新的话就会接受leader的日志
 
-	if !(args.LastLogIndex > rf.getLastLogIndex() || (args.LastLogIndex == rf.getLastLogIndex() && args.LastLogTerm >= rf.getLastLogTerm())) {
-		//先排除不符合投票条件的candidate发送过来请求
-		reply.Term = rf.CurrentTerm
-		reply.VoteGranted = false
-		reply.ok = false
-		//这里返回false 和true 是瞎写的，因为这个是本地调用基本上不会出现调用失败的情况，这个函数返回值仅仅是rpc函数前的测试而已
-		return true
-	}
-	//同时收到多个选举投票请求时（但是票已经投出去了）
-	if rf.VotedFor != -1 && args.CandidateID != rf.VotedFor {
-		reply.Term = rf.CurrentTerm
-		reply.VoteGranted = false
-		reply.ok = false
-		return true
-	} else {
-		//第一次接收到投票请求或者是重复接收到投票请求（网络故障导致candidate没有收到reply的信息,注意由于上面条件的过滤，集群中能到这边的重复请求只能是最新candidate发送过来的重复请求）
-		reply.Term = rf.CurrentTerm
+	if rf.CurrentTerm <= int(args.Term) {
+		if rf.CurrentTerm == int(args.Term) {
+			if !rf.isLogUptoDate(int(args.LastLogIndex), int(args.LastLogTerm)) {
+				return reply, nil
+			}
+		}
+		fmt.Printf("[Node %v] vote to %v", rf.me, args.CandidateId)
 		reply.VoteGranted = true
-		reply.ok = true
-		return true
+		rf.VotedFor = int(args.CandidateId)
+		rf.CurrentTerm = int(args.Term)
+		if rf.Character == Candidate || rf.Character == Leader {
+			// go back to Follower
+			reply.VoteGranted = true
+			rf.Character = Follower
+			rf.ResetTimer()
+		}
 	}
+	return reply, nil
 }
 
 func (rf *Raft) getLastLogIndexAndTerm(longIndex *int, term *int) {
@@ -407,10 +425,6 @@ func (rf *Raft) SendRequestVote(serverIdx int, args *RequestVoteArgs) (*RequestV
 	return reply, succ == nil
 }
 
-func (rf *Raft) persist() {
-
-}
-
 func (rf *Raft) doHeartBeat() {
 	//先加锁
 	rf.mu.Lock()
@@ -434,6 +448,7 @@ func (rf *Raft) doHeartBeat() {
 			//日志压缩加入后要判断是发送快照还是发送AE
 			//注意这里是小于等于后面getPreLogIndex条件会依赖 这个条件
 			if rf.nextIndex[i] <= rf.PrevSnapIndex {
+				//todo 暂时没有实现，无关紧要
 				go rf.leaderSendSnapShot()
 				continue
 			}
@@ -449,12 +464,12 @@ func (rf *Raft) doHeartBeat() {
 			logEntries := make([]*LogEntry, len(rf.Log)-int(entryPreLogIndex)-1)
 			copy(logEntries, rf.Log[1+entryPreLogIndex:])
 			appendEntriesArgs := &AppendEntriesArgs{
-				Term:         rf.CurrentTerm,
-				LeaderID:     rf.me,
-				PreLogIndex:  entryPreLogIndex,
-				PreLogTerm:   entryPreLogTerm,
-				LogEntries:   logEntries,
-				LeaderCommit: rf.CommitIndex,
+				Term:         int64(rf.CurrentTerm),
+				LeaderId:     int64(rf.me),
+				PrevLogIndex: int64(entryPreLogIndex),
+				PrevLogTerm:  int64(entryPreLogTerm),
+				LeaderCommit: int64(rf.CommitIndex),
+				Entries:      logEntries,
 			}
 
 			go func(peer int) {
@@ -462,7 +477,7 @@ func (rf *Raft) doHeartBeat() {
 				if ok {
 					if reply.Success {
 						//从服务器已经完成日志更新，将更新leader节点的状态（也就是nextIndex和matchIndex 这两个的关系是受互相制约的）
-						rf.nextIndex[peer] = appendEntriesArgs.PreLogIndex + len(logEntries)
+						rf.nextIndex[peer] = int(appendEntriesArgs.PrevLogIndex) + len(logEntries)
 						rf.matchIndex[peer] = rf.matchIndex[peer] + 1
 						fmt.Printf("[Node %v] update %v nextIndex and matchIndex to %v %v", rf.me, peer, rf.nextIndex[peer], rf.matchIndex[peer])
 						//同步日志找到集群中最大的那个matchIndex是多少
@@ -489,7 +504,7 @@ func (rf *Raft) doHeartBeat() {
 					} else {
 						//success 返回false 有两个原因 1.args 的prelogIndex比他的prelogIndex大 2.args 的prelogTerm 不是同一个Term，说明发生了选举
 						//发现对方term大，说明发生了选举，自动退回到follower角色
-						if rf.CurrentTerm < reply.Term {
+						if rf.CurrentTerm < int(reply.Term) {
 							rf.Character = Follower
 							rf.ResetTimer()
 						} else {
@@ -497,7 +512,6 @@ func (rf *Raft) doHeartBeat() {
 							rf.nextIndex[peer] = -1
 							fmt.Printf("[Node %v] update %v nextIndex to %v", rf.me, peer, rf.nextIndex[peer])
 						}
-
 					}
 				} else {
 					fmt.Printf("[Node %v] lost connection with %v", rf.me, peer)
@@ -507,10 +521,6 @@ func (rf *Raft) doHeartBeat() {
 
 		}
 	}
-}
-
-func (rf *Raft) sendHeartBeat() {
-
 }
 
 func (rf *Raft) leaderSendSnapShot() {
@@ -540,7 +550,23 @@ func (rf *Raft) SendAppendEntries(server int, args *AppendEntriesArgs) (*AppendE
 	return reply, succ == nil
 }
 
+// 利用lastapplyed指针逐渐接近commitindex 来实现同步信息
 func (rf *Raft) apply() {
+	for rf.CommitIndex > rf.lastApplied && rf.lastApplied+1 < len(rf.Log) {
+		rf.lastApplied++
+		op := rf.Log[rf.lastApplied].GetOp()
+		key := rf.Log[rf.lastApplied].GetKey()
+		value := rf.Log[rf.lastApplied].GetValue()
+
+		applymsg := ApplyMsg{
+			Op:    op,
+			Key:   key,
+			Value: value,
+			Index: rf.lastApplied,
+		}
+		rf.ApplyMsgChan <- applymsg
+		fmt.Printf("[Node %v] send msg to ch successfully with index:%v", rf.me, applymsg.Index)
+	}
 
 }
 
@@ -557,4 +583,26 @@ func (rf *Raft) ToBeLeader() {
 	}
 
 	go rf.doHeartBeat() //马上向其他节点宣告自己就是leader
+}
+
+// 判断日志是否更新
+// （“更新”的定义：）如果日志的最后一个entry具有不同的term ，则具有较晚term的日志是更加新的。如果日志以相同的term结尾，则较长的日志是更加新的。
+func (rf *Raft) isLogUptoDate(lastLogIndex int, lastLogTerm int) bool {
+	if rf.lastApplied == 0 {
+		return true
+	} else {
+		fmt.Printf("[Node %v] checking isn't logUptoDate: lastLogIndex is %v, lastLogTerm is %v", rf.me, lastLogIndex, lastLogTerm)
+		//if rf.logs[rf.lastApplied].Term > lastLogTerm || rf.lastApplied > lastLogIndex {
+		//	return false
+		//}
+		if rf.Log[len(rf.Log)-1].Term > int64(lastLogTerm) {
+			return false
+		}
+		if rf.Log[len(rf.Log)-1].Term == int64(lastLogTerm) {
+			if len(rf.Log)-1 > lastLogIndex {
+				return false
+			}
+		}
+	}
+	return true
 }
