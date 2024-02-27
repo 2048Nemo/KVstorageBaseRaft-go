@@ -55,7 +55,7 @@ func targetFunction(s SharedStruct, wg *sync.WaitGroup) {
 
 	defer wg.Done()
 	for i := 0; i < 10; i++ {
-		s.value = atomic.AddInt64(&s.value, 1)
+		atomic.AddInt64(&s.value, 1)
 	}
 
 }

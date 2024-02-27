@@ -4,6 +4,8 @@ import (
 	"context"
 	"fmt"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/keepalive"
 	"math/rand"
 	"sync"
 	"time"
@@ -54,10 +56,10 @@ type Raft struct {
 
 	// Volatile state on  leaders
 	//  leader 特有的易失性状态（选举后会重新初始化）
-	nextIndex     map[int]int //对于每台服务器想要获取的下一条日志的索引值，（初始化的这个值为leader 最后一个日志索引 + 1）
-	matchIndex    map[int]int //匹配索引,对于每个服务器该属性记录了已经复制到本节点的最高的日志的索引值（初始化为0 ， 单调增加）
-	ChanCharacter chan int    //节点改变时的通知chan
-	Character     Character   //当前本节点在Raft中的角色
+	nextIndex     []int     //对于每台服务器想要获取的下一条日志的索引值，（初始化的这个值为leader 最后一个日志索引 + 1）
+	matchIndex    []int     //匹配索引,对于每个服务器该属性记录了已经复制到本节点的最高的日志的索引值（初始化为0 ， 单调增加）
+	ChanCharacter chan int  //节点改变时的通知chan
+	Character     Character //当前本节点在Raft中的角色
 
 	election_timeout  *time.Timer
 	heartbeat_timeout *time.Timer //定时器
@@ -76,6 +78,50 @@ type ApplyMsg struct {
 	Key   string
 	Value int32
 	Index int
+}
+
+func NewRaft(me int, peers []int, addrs []string, applych chan ApplyMsg) *Raft {
+	fmt.Printf("[Node %v] enter newKVServer\n", me)
+	iniEntry := &LogEntry{
+		Term:  0,
+		Index: 0,
+	}
+	logs := make([]*LogEntry, 0)
+	logs = append(logs, iniEntry)
+	stubs := make([]*RaftKVClient, len(peers))
+	// connect to other servers
+	conns := make([]*grpc.ClientConn, len(peers))
+
+	rf := &Raft{
+		me:                me,
+		peers:             peers,
+		addrs:             addrs,
+		Character:         Follower,
+		Log:               logs,
+		stubs:             stubs,
+		conns:             conns,
+		CurrentTerm:       0,
+		VotedFor:          -1,
+		CommitIndex:       0,
+		lastApplied:       0,
+		nextIndex:         make([]int, len(peers)),
+		matchIndex:        make([]int, len(peers)),
+		election_timeout:  time.NewTimer(RandElectionTimeout()),
+		heartbeat_timeout: time.NewTimer(HeartbeatTimeout()),
+		ApplyMsgChan:      applych,
+		killed:            false,
+	}
+
+	//go rf.ticker()
+	fmt.Printf("[Node %v] finished newKVnode\n", me)
+	return rf
+}
+
+func RandElectionTimeout() time.Duration {
+	//随机选举超时时间 定义随机间隔为 120-320ms
+	timeout := (rand.Intn(300)%300 + 120)
+	//在这里发现时间包中的变量直接乘以整数会爆红，应该转化成int64的值
+	return time.Millisecond * time.Duration(timeout)
 }
 
 // Raft 对外提供的接口
@@ -99,14 +145,15 @@ func (rf *Raft) ResetTimer() {
 	fmt.Println("定时器reset，当前时间为：", time.Now())
 	if rf.Character == Leader {
 		//心跳间隔时间
-		rf.heartbeat_timeout.Reset(time.Millisecond * 100)
+		rf.heartbeat_timeout.Reset(HeartbeatTimeout())
 	} else {
-		//随机选举超时时间 定义随机间隔为 120-320ms
-		timeout := (rand.Intn(300)%300 + 120)
-		//在这里发现时间包中的变量直接乘以整数会爆红，应该转化成int64的值
-		rf.election_timeout.Reset(time.Millisecond * time.Duration(timeout))
+		rf.election_timeout.Reset(RandElectionTimeout())
 	}
 	fmt.Println("当前时间为:", time.Now())
+}
+
+func HeartbeatTimeout() time.Duration {
+	return time.Millisecond * 100
 }
 
 func (rf *Raft) ticker() {
@@ -118,7 +165,7 @@ func (rf *Raft) ticker() {
 		case <-rf.heartbeat_timeout.C:
 			rf.mu.Lock()
 			if currentState == Leader {
-				//fmt.Printf("[Node %v] send heart beart", rf.me)
+				fmt.Printf("[Node %v] send heart beart\n", rf.me)
 				// 发送心跳检测
 				rf.doHeartBeat()
 			}
@@ -299,11 +346,11 @@ func (rf *Raft) doElection() {
 			}
 			go func(peer int) {
 				start := time.Now()
-				fmt.Printf("[func-sendRequestVote {%d}] 向server{%d} 发送 RequestVote 开始", rf.me, rf.CurrentTerm, rf.getLastLogIndex())
+				fmt.Printf("[func-sendRequestVote {%d}] 向server{%d} 发送 RequestVote 开始\n", rf.me, rf.getLastLogIndex())
 
 				reply, succ := rf.SendRequestVote(peer, requestVoteArgs)
 
-				fmt.Printf("[func-sendRequestVote {%d}] 向server{%d} 发送 RequestVote 结束，耗时:{%v} ms", rf.me, rf.CurrentTerm, rf.getLastLogIndex(), time.Now().Sub(start))
+				fmt.Printf("[func-sendRequestVote {%d}] 向server{%d} 发送 RequestVote 结束，耗时:{%v} ms\n", rf.me, rf.getLastLogIndex(), time.Now().Sub(start))
 
 				if !succ {
 					fmt.Printf("RequestVote to server %d failed at %s\n", peer, start.String())
@@ -329,7 +376,7 @@ func (rf *Raft) doElection() {
 
 						//为什么要+1？因为这个peers 整个集群的数量通常是单数，所以加个1向上取整
 						if votedNum >= len(rf.peers)/2+1 {
-							fmt.Printf("[Node %v] become a new leader", rf.me)
+							fmt.Printf("[Node %v] become a new leader\n", rf.me)
 							rf.ToBeLeader()
 						}
 						votelock.Unlock()
@@ -361,7 +408,7 @@ func (rf *Raft) RequestVoteRequestVote(ctx context.Context, args *RequestVoteArg
 	//第三种： leader传递过来的日志更旧
 	if rf.CurrentTerm > int(args.GetTerm()) || (rf.CurrentTerm == int(args.GetTerm()) && rf.VotedFor != -1 && int64(rf.VotedFor) != args.GetCandidateId()) || !rf.isLogUptoDate(int(args.LastLogIndex), int(args.LastLogTerm)) {
 		// has voted to another Candidate
-		fmt.Printf("[Node %v] DO NOT vote to %v, rf.votedFor is %v", rf.me, args.CandidateId, rf.VotedFor)
+		fmt.Printf("[Node %v] DO NOT vote to %v, rf.votedFor is %v\n", rf.me, args.CandidateId, rf.VotedFor)
 		return reply, nil
 	}
 
@@ -377,7 +424,7 @@ func (rf *Raft) RequestVoteRequestVote(ctx context.Context, args *RequestVoteArg
 				return reply, nil
 			}
 		}
-		fmt.Printf("[Node %v] vote to %v", rf.me, args.CandidateId)
+		fmt.Printf("[Node %v] vote to %v\n", rf.me, args.CandidateId)
 		reply.VoteGranted = true
 		rf.VotedFor = int(args.CandidateId)
 		rf.CurrentTerm = int(args.Term)
@@ -425,6 +472,7 @@ func (rf *Raft) SendRequestVote(serverIdx int, args *RequestVoteArgs) (*RequestV
 	return reply, succ == nil
 }
 
+// 我这边是将append
 func (rf *Raft) doHeartBeat() {
 	//先加锁
 	rf.mu.Lock()
@@ -440,7 +488,7 @@ func (rf *Raft) doHeartBeat() {
 			}
 			fmt.Printf("[func-Raft::doHeartBeat()-Leader: {%d}] Leader的心跳定时器触发了 index:{%d}\n", rf.me, i)
 			if rf.nextIndex[i] >= 1 {
-				fmt.Errorf("rf.nextIndex[%d] = {%d}", i, rf.nextIndex[i])
+				fmt.Printf("rf.nextIndex[%d] = {%d}\n", i, rf.nextIndex[i])
 				return
 			}
 
@@ -461,8 +509,8 @@ func (rf *Raft) doHeartBeat() {
 			//发送ae，先生成appendEntry实体 和 appendEntryReply
 
 			//生成logEntries 由nextIndex【server】记录的index -1开始复制到末尾
-			logEntries := make([]*LogEntry, len(rf.Log)-int(entryPreLogIndex)-1)
-			copy(logEntries, rf.Log[1+entryPreLogIndex:])
+			logEntries := make([]*LogEntry, len(rf.Log[rf.nextIndex[i]:]))
+			copy(logEntries, rf.Log[rf.nextIndex[i]:])
 			appendEntriesArgs := &AppendEntriesArgs{
 				Term:         int64(rf.CurrentTerm),
 				LeaderId:     int64(rf.me),
@@ -476,10 +524,10 @@ func (rf *Raft) doHeartBeat() {
 				reply, ok := rf.SendAppendEntries(peer, appendEntriesArgs)
 				if ok {
 					if reply.Success {
-						//从服务器已经完成日志更新，将更新leader节点的状态（也就是nextIndex和matchIndex 这两个的关系是受互相制约的）
+						//从节点已经完成日志更新，将更新leader节点的状态（也就是nextIndex和matchIndex 这两个的关系是受互相制约的），并提交和通知从节点提交
 						rf.nextIndex[peer] = int(appendEntriesArgs.PrevLogIndex) + len(logEntries)
 						rf.matchIndex[peer] = rf.matchIndex[peer] + 1
-						fmt.Printf("[Node %v] update %v nextIndex and matchIndex to %v %v", rf.me, peer, rf.nextIndex[peer], rf.matchIndex[peer])
+						fmt.Printf("[Node %v] update %v nextIndex and matchIndex to %v %v\n", rf.me, peer, rf.nextIndex[peer], rf.matchIndex[peer])
 						//同步日志找到集群中最大的那个matchIndex是多少
 						toCommit := make([]int, len(rf.peers))
 						for peer := range rf.peers {
@@ -497,7 +545,7 @@ func (rf *Raft) doHeartBeat() {
 								//这里可以加上幂等性操作比如 sum == (peerLen/2) + 1 ,或者是在进入条件后将sum赋值为零，不过由于这边sum是临时的变量几乎不需要考虑幂等性
 								rf.CommitIndex = int(i)
 								rf.apply()
-								fmt.Printf("[Node %v] commitIndex is %v", rf.me, rf.CommitIndex)
+								fmt.Printf("[Node %v] commitIndex is %v\n", rf.me, rf.CommitIndex)
 								break
 							}
 						}
@@ -510,15 +558,13 @@ func (rf *Raft) doHeartBeat() {
 						} else {
 							//没有匹配的日志
 							rf.nextIndex[peer] = -1
-							fmt.Printf("[Node %v] update %v nextIndex to %v", rf.me, peer, rf.nextIndex[peer])
+							fmt.Printf("[Node %v] update %v nextIndex to %v\n", rf.me, peer, rf.nextIndex[peer])
 						}
 					}
 				} else {
-					fmt.Printf("[Node %v] lost connection with %v", rf.me, peer)
+					fmt.Printf("[Node %v] lost connection with %v\n", rf.me, peer)
 				}
-
 			}(i)
-
 		}
 	}
 }
@@ -564,10 +610,10 @@ func (rf *Raft) apply() {
 			Value: value,
 			Index: rf.lastApplied,
 		}
+		//终于弄懂这个发送管道什么意思了： 将消息暴露给外部，以便数据提交（注意：数据持久化是单独的一个数据结构也就是本项目中的kvServer中的storage，它会将数据复制一份持久化）
 		rf.ApplyMsgChan <- applymsg
-		fmt.Printf("[Node %v] send msg to ch successfully with index:%v", rf.me, applymsg.Index)
+		fmt.Printf("[Node %v] send msg to ch successfully with index:%v\n", rf.me, applymsg.Index)
 	}
-
 }
 
 func (rf *Raft) ToBeLeader() {
@@ -591,7 +637,7 @@ func (rf *Raft) isLogUptoDate(lastLogIndex int, lastLogTerm int) bool {
 	if rf.lastApplied == 0 {
 		return true
 	} else {
-		fmt.Printf("[Node %v] checking isn't logUptoDate: lastLogIndex is %v, lastLogTerm is %v", rf.me, lastLogIndex, lastLogTerm)
+		fmt.Printf("[Node %v] checking isn't logUptoDate: lastLogIndex is %v, lastLogTerm is %v\n", rf.me, lastLogIndex, lastLogTerm)
 		//if rf.logs[rf.lastApplied].Term > lastLogTerm || rf.lastApplied > lastLogIndex {
 		//	return false
 		//}
@@ -605,4 +651,86 @@ func (rf *Raft) isLogUptoDate(lastLogIndex int, lastLogTerm int) bool {
 		}
 	}
 	return true
+}
+
+func (rf *Raft) Connect() {
+	for peer := range rf.peers {
+		if peer == rf.me {
+			continue
+		}
+		fmt.Printf("[Node %v] is connecting with %v in %v\n", rf.me, peer, rf.addrs[peer])
+		alive := keepalive.ClientParameters{
+			Time:    1 * time.Minute,
+			Timeout: 10 * time.Second,
+		}
+		conn, err := grpc.Dial(rf.addrs[peer], grpc.WithTransportCredentials(insecure.NewCredentials()), grpc.WithKeepaliveParams(alive))
+		if err != nil {
+			panic(err)
+		}
+		raftClient := NewRaftKVClient(conn)
+		rf.stubs[peer] = &raftClient
+	}
+	time.Sleep(10 * time.Millisecond)
+	go rf.ticker()
+	fmt.Printf("[Node %v] connect with others\n", rf.me)
+}
+
+// 将客户端发送过来的消息封装成comand并发送给从节点们
+func (rf *Raft) Exec(op string, key string, value int64) (int, int, bool) {
+	index := -1
+	term := -1
+	isLeader := rf.IsLeader()
+	if isLeader {
+		//leader负责将从文件服务器发送过来的操作信息封装成kv数据库操作command结构
+		rf.mu.Lock()
+		term = rf.CurrentTerm
+		index = len(rf.Log)
+		rf.Log = append(rf.Log, &LogEntry{
+			Term:  int64(term),
+			Index: int64(index),
+			Op:    op,
+			Key:   key,
+			Value: int32(value),
+		})
+		rf.doHeartBeat()
+		rf.mu.Unlock()
+	}
+	return index, term, isLeader
+}
+
+func (rf *Raft) IsLeader() bool {
+	return rf.Character == Leader
+}
+
+func (rf *Raft) Close() error {
+	rf.mu.Lock()
+	rf.killed = true
+	rf.mu.Unlock()
+
+	for {
+		rf.mu.Lock()
+		//等待提交进度完成
+		if rf.lastApplied == rf.CommitIndex {
+			fmt.Printf("[Node %v] finished applying all committed logs\n", rf.me)
+			rf.election_timeout.Stop()
+			rf.heartbeat_timeout.Stop()
+			rf.killed = true
+			rf.mu.Unlock()
+			break
+		}
+		rf.mu.Unlock()
+		//注意这里的sleep以释放锁，好让这段时间内提交进度
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	for i := range rf.conns {
+		if i == rf.me {
+			continue
+		}
+		err := rf.conns[i].Close()
+		if err != nil {
+			panic(err)
+		}
+	}
+	return nil
 }
