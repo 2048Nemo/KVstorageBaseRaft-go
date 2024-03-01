@@ -6,13 +6,11 @@ import (
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/credentials/insecure"
 	"google.golang.org/grpc/keepalive"
+	"google.golang.org/protobuf/runtime/protoimpl"
 	"math/rand"
 	"sync"
 	"time"
 )
-
-type Persister struct {
-}
 
 // 定义raft算法中角色的枚举类型
 
@@ -40,8 +38,7 @@ type Raft struct {
 	stubs []*RaftKVClient
 	addrs []string
 
-	persister *Persister // 持久化信息
-	me        int        // 本节点在成员通讯信息的index
+	me int // 本节点在成员通讯信息的index
 
 	//Persistent state on all servers
 	//所有服务器都有的持久性状态（在响应RPC请求之前必须先保存状态）
@@ -82,6 +79,7 @@ type ApplyMsg struct {
 
 func NewRaft(me int, peers []int, addrs []string, applych chan ApplyMsg) *Raft {
 	fmt.Printf("[Node %v] enter newKVServer\n", me)
+	//这个initEntry实际上就是一个占位的功能，并没有实际含义，所以
 	iniEntry := &LogEntry{
 		Term:  0,
 		Index: 0,
@@ -113,13 +111,13 @@ func NewRaft(me int, peers []int, addrs []string, applych chan ApplyMsg) *Raft {
 	}
 
 	//go rf.ticker()
-	fmt.Printf("[Node %v] finished newKVnode\n", me)
+	fmt.Printf("[Node %v] finished newKVnode：%# v\n", me, rf)
 	return rf
 }
 
 func RandElectionTimeout() time.Duration {
-	//随机选举超时时间 定义随机间隔为 120-320ms
-	timeout := (rand.Intn(300)%300 + 120)
+	//随机选举超时时间 定义随机间隔为 320-420ms
+	timeout := (rand.Intn(100)%100 + 320)
 	//在这里发现时间包中的变量直接乘以整数会爆红，应该转化成int64的值
 	return time.Millisecond * time.Duration(timeout)
 }
@@ -142,14 +140,14 @@ func (rf *Raft) ResetTimer() {
 	//而随机超时选举时间会长很多，因为选举频率高的话，那么整个集群可用时间就会降低，那么选票的瓜分就会增大，这样就会导致选举的效率降低
 	//一般而言 广播时间(0.5ms-20ms) < 心跳检测时间 < 随机超时选举时间(10ms - 500 ms) < MTBF(Mean Time Before Failure)平均故障时间 一般而言服务器这个指数为几个月甚至更长
 
-	fmt.Println("定时器reset，当前时间为：", time.Now())
+	//fmt.Println("定时器reset，当前时间为：", time.Now())
 	if rf.Character == Leader {
 		//心跳间隔时间
 		rf.heartbeat_timeout.Reset(HeartbeatTimeout())
 	} else {
 		rf.election_timeout.Reset(RandElectionTimeout())
 	}
-	fmt.Println("当前时间为:", time.Now())
+	//fmt.Println("当前时间为:", time.Now())
 }
 
 func HeartbeatTimeout() time.Duration {
@@ -163,18 +161,20 @@ func (rf *Raft) ticker() {
 		rf.mu.Unlock()
 		select {
 		case <-rf.heartbeat_timeout.C:
-			rf.mu.Lock()
+			//rf.mu.Lock()
 			if currentState == Leader {
 				fmt.Printf("[Node %v] send heart beart\n", rf.me)
 				// 发送心跳检测
 				rf.doHeartBeat()
 			}
-			rf.mu.Unlock()
+			//rf.mu.Unlock()
 		case <-rf.election_timeout.C:
-			rf.mu.Lock()
+			//发现不能在这边加锁，因为doelection里面还加锁了
+			//rf.mu.Lock()
 			//遵从单一职责原则，不选择在这边重置选举超时
+			fmt.Printf("[Node %v] send election request\n", rf.me)
 			rf.doElection()
-			rf.mu.Unlock()
+			//rf.mu.Unlock()
 		}
 	}
 }
@@ -198,6 +198,7 @@ func (rf *Raft) ticker() {
 // - 达成一致后选取达成一致(quorum)的index置为commitIndex
 
 func (rf *Raft) AppendEntries(ctx context.Context, args *AppendEntriesArgs) (*AppendEntriesReply, error) {
+	fmt.Printf("---[Node %v].%v receive a appendEntries from %v\n", rf.me, rf.Character, args.GetLeaderId())
 	reply := &AppendEntriesReply{}
 	reply.Term = int64(rf.CurrentTerm)
 	reply.Success = false
@@ -233,16 +234,16 @@ func (rf *Raft) AppendEntries(ctx context.Context, args *AppendEntriesArgs) (*Ap
 	//如果是心跳检测的话那将没有log entry
 	if len(args.Entries) == 0 {
 		//收到心跳检测，刷新定时器
-		fmt.Printf("[Node %v].%v receive a empty Entry from %v", rf.me, rf.Character, args.GetLeaderId())
+		fmt.Printf("---[Node %v].%v receive a empty Entry from %v\n", rf.me, rf.Character, args.GetLeaderId())
 		//一定要先回退到character follower 角色，因为我写的定时器刷星机制是和角色挂钩的
 		rf.Character = Follower
 		//刷新定时器
 		rf.ResetTimer()
 		//心跳检测刷新定时后进行同步leader 发过来得commitindex
 		if int(args.LeaderCommit) > rf.CommitIndex {
-			fmt.Printf("[Node %v] receive a LEADERCOMMIT %v ", rf.me, args.GetLeaderCommit())
+			fmt.Printf("---[Node %v] receive a LEADERCOMMIT %v \n", rf.me, args.GetLeaderCommit())
 			rf.CommitIndex = min(int(args.LeaderCommit), rf.CommitIndex)
-			fmt.Printf("[Node %v] update its commitIndex to %v ", rf.me, rf.CommitIndex)
+			fmt.Printf("---[Node %v] update its commitIndex to %v \n", rf.me, rf.CommitIndex)
 		}
 		return reply, nil
 	}
@@ -265,16 +266,16 @@ func (rf *Raft) AppendEntries(ctx context.Context, args *AppendEntriesArgs) (*Ap
 	//}
 	rf.Character = Follower
 	rf.ResetTimer()
-	fmt.Printf("[Node %v] receive appendentries with entry %+v. And currentTerm is %v, logs len is %v, committedIndex is: %v", rf.me, args.Entries[0], rf.CurrentTerm, len(rf.Log), rf.CommitIndex)
+	fmt.Printf("---[Node %v] receive appendentries with entry %+v. And currentTerm is %v, logs len is %v, committedIndex is: %v\n", rf.me, args.Entries[0], rf.CurrentTerm, len(rf.Log), rf.CommitIndex)
 	rf.Log = rf.Log[:args.PrevLogIndex+1]
 	rf.Log = append(rf.Log, args.Entries...)
 	//debug.Dlog("[Node %v]'s loglen is %v after append", rf.me, len(rf.logs))
 	if int(args.GetLeaderCommit()) > rf.CommitIndex {
-		fmt.Printf("[Node %v]'s commit Index is less then Leader's", rf.me)
+		fmt.Printf("---[Node %v]'s commit Index is less then Leader's\n", rf.me)
 		rf.CommitIndex = min(int(args.LeaderCommit), rf.CommitIndex)
 		rf.apply()
 	}
-	fmt.Printf("[Node %v]'s lastapplied log is %+v ,commited Index is %v", rf.me, rf.Log[rf.CommitIndex], rf.CommitIndex)
+	fmt.Printf("---[Node %v]'s lastapplied log is %+v ,commited Index is %v\n", rf.me, rf.Log[rf.CommitIndex], rf.CommitIndex)
 	reply.Success = true
 	return reply, nil
 }
@@ -320,7 +321,7 @@ func (rf *Raft) doElection() {
 		//重置计时器
 		//调用这个方法的必定是从follower 想变成 candidate 的所以应该在投票的同时将 character 转换成 candidate
 		rf.Character = Candidate
-		//todo 持久化persist（）实现
+
 		rf.ResetTimer()
 
 		votedNum := 1 //投票数
@@ -361,25 +362,27 @@ func (rf *Raft) doElection() {
 					rf.mu.Lock()
 					defer rf.mu.Unlock()
 					//对回应进行处理，要记得无论什么时候收到回复就要检查term
-					if reply.Term > int64(rf.CurrentTerm) {
-						//尴尬了别人term大说明集群已经完成选leader了，身份应该从candidate转变为follower
-						//三变： 身份，term，和投票,防止遗忘
-						rf.Character = Follower
-						rf.CurrentTerm = int(reply.GetTerm())
-						rf.VotedFor = -1
-						rf.ResetTimer()
-					} else if reply.GetVoteGranted() {
-						//获得选票
-						//否则就是接收到别人的票了，现在开始检查票数是否超过半数，是就当选
-						votelock.Lock()
-						votedNum += 1
+					if int64(rf.CurrentTerm) == requestVoteArgs.GetTerm() && rf.Character == Candidate {
+						if reply.Term > int64(rf.CurrentTerm) {
+							//尴尬了别人term大说明集群已经完成选leader了，身份应该从candidate转变为follower
+							//三变： 身份，term，和投票,防止遗忘
+							rf.Character = Follower
+							rf.CurrentTerm = int(reply.GetTerm())
+							rf.VotedFor = -1
+							rf.ResetTimer()
+						} else if reply.GetVoteGranted() {
+							//获得选票
+							//否则就是接收到别人的票了，现在开始检查票数是否超过半数，是就当选
+							votelock.Lock()
+							votedNum += 1
 
-						//为什么要+1？因为这个peers 整个集群的数量通常是单数，所以加个1向上取整
-						if votedNum >= len(rf.peers)/2+1 {
-							fmt.Printf("[Node %v] become a new leader\n", rf.me)
-							rf.ToBeLeader()
+							//为什么要+1？因为这个peers 整个集群的数量通常是单数，所以加个1向上取整
+							if votedNum >= len(rf.peers)/2+1 {
+								fmt.Printf("[Node %v] become a new leader\n", rf.me)
+								rf.ToBeLeader()
+							}
+							votelock.Unlock()
 						}
-						votelock.Unlock()
 					}
 				}
 			}(i)
@@ -394,7 +397,14 @@ func (rf *Raft) doElection() {
 // - 如果votedFor为空或者有candidateID，并且候选人的日志至少与接收者的日志一样新，投赞成票并刷新计时器。至少一样新是指：
 //
 //	args.LastLogIndex > my.LastLogIndex || (args.LastLogIndex == my.LastLogIndex && LastLogTerm >= Log[LastLogIndex].Term)
-func (rf *Raft) RequestVoteRequestVote(ctx context.Context, args *RequestVoteArgs) (reply *RequestVoteReply, err error) {
+func (rf *Raft) RequestVote(ctx context.Context, args *RequestVoteArgs) (reply *RequestVoteReply, err error) {
+	reply = &RequestVoteReply{
+		state:         protoimpl.MessageState{},
+		sizeCache:     0,
+		unknownFields: nil,
+		Term:          0,
+		VoteGranted:   false,
+	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -438,17 +448,16 @@ func (rf *Raft) RequestVoteRequestVote(ctx context.Context, args *RequestVoteArg
 	return reply, nil
 }
 
-func (rf *Raft) getLastLogIndexAndTerm(longIndex *int, term *int) {
+func (rf *Raft) getLastLogIndexAndTerm(lastlongIndex *int, term *int) {
 	//防止一开始（或者已删除导致没有日志了）本机上没有日志，导致访问越界
-	if len(rf.Log) == 0 {
-		*longIndex = rf.PrevSnapIndex
-		*term = rf.PrevSnapTerm
+	if len(rf.Log) > 0 {
+		*lastlongIndex = int(len(rf.Log) - 1)
+		*term = int(rf.Log[len(rf.Log)-1].Term)
 	} else {
 		//存在日志可以直接访问获取
-		*longIndex = int(rf.Log[len(rf.Log)-1].Index)
-		*term = int(rf.Log[len(rf.Log)-1].Term)
+		*lastlongIndex = int(len(rf.Log) - 1)
+		*term = 0
 	}
-
 	return
 }
 func (rf *Raft) getLastLogTerm() int {
@@ -469,15 +478,12 @@ func (rf *Raft) SendRequestVote(serverIdx int, args *RequestVoteArgs) (*RequestV
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
 	defer cancel()
 	reply, succ := (*rf.stubs[serverIdx]).RequestVote(ctx, args)
+	fmt.Printf("向 node[%v] request vote 的请求结果是：succ %v\n", serverIdx, succ == nil)
 	return reply, succ == nil
 }
 
 // 我这边是将append
 func (rf *Raft) doHeartBeat() {
-	//先加锁
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-
 	if rf.Character == Leader {
 		//向除了自己以外的所有节点发送消息appendEntry消息
 		fmt.Printf("[func-Raft::doHeartBeat()-Leader: {%d}] Leader的心跳定时器触发了\n", rf.me)
@@ -489,28 +495,30 @@ func (rf *Raft) doHeartBeat() {
 			fmt.Printf("[func-Raft::doHeartBeat()-Leader: {%d}] Leader的心跳定时器触发了 index:{%d}\n", rf.me, i)
 			if rf.nextIndex[i] >= 1 {
 				fmt.Printf("rf.nextIndex[%d] = {%d}\n", i, rf.nextIndex[i])
-				return
 			}
 
 			//比快照索引小则发送快照
 			//日志压缩加入后要判断是发送快照还是发送AE
 			//注意这里是小于等于后面getPreLogIndex条件会依赖 这个条件
-			if rf.nextIndex[i] <= rf.PrevSnapIndex {
-				//todo 暂时没有实现，无关紧要
-				go rf.leaderSendSnapShot()
-				continue
-			}
+			//if rf.nextIndex[i] <= rf.PrevSnapIndex {
+			//	//todo 暂时没有实现，无关紧要
+			//	go rf.leaderSendSnapShot()
+			//	continue
+			//}
 
 			//这两个变量是专门计算将要发送的appendEntries需要的参数
-			entryPreLogIndex := -1
-			entryPreLogTerm := -1
 			//这个本质上就是跟据follower的nextindex计算出来项目中的接下来要发送的ae信息
-			rf.getPreLogInfo(i, &entryPreLogIndex, &entryPreLogTerm)
+			entryPreLogIndex := rf.nextIndex[i] - 1
+			if entryPreLogIndex < 0 {
+				fmt.Printf("[Node %v] don't send heartbeat to %v", rf.me, i)
+				continue
+			}
+			entryPreLogTerm := rf.Log[entryPreLogIndex].Term
 			//发送ae，先生成appendEntry实体 和 appendEntryReply
 
 			//生成logEntries 由nextIndex【server】记录的index -1开始复制到末尾
 			logEntries := make([]*LogEntry, len(rf.Log[rf.nextIndex[i]:]))
-			copy(logEntries, rf.Log[rf.nextIndex[i]:])
+			copy(logEntries, rf.Log[entryPreLogIndex+1:])
 			appendEntriesArgs := &AppendEntriesArgs{
 				Term:         int64(rf.CurrentTerm),
 				LeaderId:     int64(rf.me),
@@ -525,14 +533,13 @@ func (rf *Raft) doHeartBeat() {
 				if ok {
 					if reply.Success {
 						//从节点已经完成日志更新，将更新leader节点的状态（也就是nextIndex和matchIndex 这两个的关系是受互相制约的），并提交和通知从节点提交
-						rf.nextIndex[peer] = int(appendEntriesArgs.PrevLogIndex) + len(logEntries)
-						rf.matchIndex[peer] = rf.matchIndex[peer] + 1
-						fmt.Printf("[Node %v] update %v nextIndex and matchIndex to %v %v\n", rf.me, peer, rf.nextIndex[peer], rf.matchIndex[peer])
+						rf.matchIndex[peer] = int(appendEntriesArgs.PrevLogIndex) + len(logEntries)
+						rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+						fmt.Printf("[Leader Node %v] update  nextIndex[%v] and matchIndex[%v] to %v %v\n", rf.me, peer, peer, rf.nextIndex[peer], rf.matchIndex[peer])
 						//同步日志找到集群中最大的那个matchIndex是多少
-						toCommit := make([]int, len(rf.peers))
-						for peer := range rf.peers {
-							matchIndex := rf.matchIndex[peer]
-							toCommit[matchIndex]++
+						toCommit := make([]int, len(rf.Log))
+						for i := 0; i < len(rf.matchIndex); i++ {
+							toCommit[rf.matchIndex[i]]++
 						}
 						//计算toCommit中最大的是谁，然后就commit它
 						peerLen := len(rf.peers)
@@ -571,19 +578,6 @@ func (rf *Raft) doHeartBeat() {
 
 func (rf *Raft) leaderSendSnapShot() {
 
-}
-
-func (rf *Raft) getPreLogInfo(server int, entryPreLogIndex *int, entryPreLogTerm *int) {
-	//logs长度为0返回0,0，不是0就根据nextIndex数组的数值返回
-	if rf.nextIndex[server] == rf.PrevSnapIndex+1 {
-		//有现成的快照索引于是直接返回便是
-		*entryPreLogIndex = rf.PrevSnapIndex
-		*entryPreLogTerm = rf.PrevSnapTerm
-		return
-	}
-	nextidx := rf.nextIndex[server]
-	*entryPreLogIndex = nextidx - 1
-	*entryPreLogTerm = int(rf.Log[nextidx].Term)
 }
 
 func (rf *Raft) SendAppendEntries(server int, args *AppendEntriesArgs) (*AppendEntriesReply, bool) {
@@ -672,7 +666,7 @@ func (rf *Raft) Connect() {
 	}
 	time.Sleep(10 * time.Millisecond)
 	go rf.ticker()
-	fmt.Printf("[Node %v] connect with others\n", rf.me)
+	fmt.Printf("[Node %v] connect with others :%# v\n", rf.me, rf)
 }
 
 // 将客户端发送过来的消息封装成comand并发送给从节点们
@@ -682,7 +676,6 @@ func (rf *Raft) Exec(op string, key string, value int64) (int, int, bool) {
 	isLeader := rf.IsLeader()
 	if isLeader {
 		//leader负责将从文件服务器发送过来的操作信息封装成kv数据库操作command结构
-		rf.mu.Lock()
 		term = rf.CurrentTerm
 		index = len(rf.Log)
 		rf.Log = append(rf.Log, &LogEntry{
@@ -693,7 +686,6 @@ func (rf *Raft) Exec(op string, key string, value int64) (int, int, bool) {
 			Value: int32(value),
 		})
 		rf.doHeartBeat()
-		rf.mu.Unlock()
 	}
 	return index, term, isLeader
 }

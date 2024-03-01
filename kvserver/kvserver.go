@@ -193,3 +193,7 @@ func (kv *KVserver) persist() error {
 	}
 	return nil
 }
+
+func (server *KVserver) IsLeader() bool {
+	return server.node.IsLeader()
+}

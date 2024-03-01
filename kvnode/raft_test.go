@@ -24,7 +24,7 @@ func TestInit(t *testing.T) {
 	fmt.Printf("Testing Make:\n")
 
 	for index := 0; index < 3; index++ {
-		server := NewRaft(index, peers, addrs, nil)
+		server := NewRaft(index, peers, addrs, make(chan ApplyMsg))
 
 		lis, err := net.Listen("tcp", addrs[index])
 		if err != nil {
@@ -46,7 +46,7 @@ func TestInit(t *testing.T) {
 	for index := 0; index < 3; index++ {
 		servers[index].Connect()
 	}
-	time.Sleep(10 * time.Second)
+	time.Sleep(1 * time.Second)
 	t.Run("init finished", TestTicker)
 }
 
