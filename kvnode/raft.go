@@ -115,13 +115,6 @@ func NewRaft(me int, peers []int, addrs []string, applych chan ApplyMsg) *Raft {
 	return rf
 }
 
-func RandElectionTimeout() time.Duration {
-	//随机选举超时时间 定义随机间隔为 320-420ms
-	timeout := (rand.Intn(100)%100 + 320)
-	//在这里发现时间包中的变量直接乘以整数会爆红，应该转化成int64的值
-	return time.Millisecond * time.Duration(timeout)
-}
-
 // Raft 对外提供的接口
 
 // 返回当前状态 1.term 2.该服务器认为自己是否是leader
@@ -152,6 +145,13 @@ func (rf *Raft) ResetTimer() {
 
 func HeartbeatTimeout() time.Duration {
 	return time.Millisecond * 100
+}
+
+func RandElectionTimeout() time.Duration {
+	//随机选举超时时间 定义随机间隔为 320-420ms
+	timeout := (rand.Intn(100)%100 + 320)
+	//在这里发现时间包中的变量直接乘以整数会爆红，应该转化成int64的值
+	return time.Millisecond * time.Duration(timeout)
 }
 
 func (rf *Raft) ticker() {
@@ -275,7 +275,7 @@ func (rf *Raft) AppendEntries(ctx context.Context, args *AppendEntriesArgs) (*Ap
 		rf.CommitIndex = min(int(args.LeaderCommit), rf.CommitIndex)
 		rf.apply()
 	}
-	fmt.Printf("---[Node %v]'s lastapplied log is %+v ,commited Index is %v\n", rf.me, rf.Log[rf.CommitIndex], rf.CommitIndex)
+	fmt.Printf("---[Node %v]'s lastapplied log is %v ,commited Index is %v\n", rf.me, rf.lastApplied, rf.CommitIndex)
 	reply.Success = true
 	return reply, nil
 }
@@ -347,14 +347,14 @@ func (rf *Raft) doElection() {
 			}
 			go func(peer int) {
 				start := time.Now()
-				fmt.Printf("[func-sendRequestVote {%d}] 向server{%d} 发送 RequestVote 开始\n", rf.me, rf.getLastLogIndex())
+				fmt.Printf("[func-sendRequestVote {%d}] 向node{%d} 发送 RequestVote 开始\n", rf.me, peer)
 
 				reply, succ := rf.SendRequestVote(peer, requestVoteArgs)
 
-				fmt.Printf("[func-sendRequestVote {%d}] 向server{%d} 发送 RequestVote 结束，耗时:{%v} ms\n", rf.me, rf.getLastLogIndex(), time.Now().Sub(start))
+				fmt.Printf("[func-sendRequestVote {%d}] 向node{%d} 发送 RequestVote 结束，耗时:{%v}\n", rf.me, peer, time.Now().Sub(start))
 
 				if !succ {
-					fmt.Printf("RequestVote to server %d failed at %s\n", peer, start.String())
+					fmt.Printf("RequestVote to node %d failed at %s\n", peer, start.String())
 					return
 				} else {
 					//调用rpc成功说明这次调用网络畅通
@@ -377,7 +377,7 @@ func (rf *Raft) doElection() {
 							votedNum += 1
 
 							//为什么要+1？因为这个peers 整个集群的数量通常是单数，所以加个1向上取整
-							if votedNum >= len(rf.peers)/2+1 {
+							if votedNum >= (len(rf.peers)+1)/2 {
 								fmt.Printf("[Node %v] become a new leader\n", rf.me)
 								rf.ToBeLeader()
 							}
@@ -388,7 +388,6 @@ func (rf *Raft) doElection() {
 			}(i)
 		}
 	}
-
 	return
 }
 
@@ -475,7 +474,8 @@ func (rf *Raft) getLastLogIndex() int {
 }
 
 func (rf *Raft) SendRequestVote(serverIdx int, args *RequestVoteArgs) (*RequestVoteReply, bool) {
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+	//广播通信时间，这个时间是要比心跳检测时间短的
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	reply, succ := (*rf.stubs[serverIdx]).RequestVote(ctx, args)
 	fmt.Printf("向 node[%v] request vote 的请求结果是：succ %v\n", serverIdx, succ == nil)
@@ -563,7 +563,7 @@ func (rf *Raft) doHeartBeat() {
 							rf.Character = Follower
 							rf.ResetTimer()
 						} else {
-							//没有匹配的日志
+							//没有匹配的日志,这里可以采用一些优化手段，来逼近匹配日志，比如论文提供的一个叫抽屉发来实现快速重试匹配日志
 							rf.nextIndex[peer] = -1
 							fmt.Printf("[Node %v] update %v nextIndex to %v\n", rf.me, peer, rf.nextIndex[peer])
 						}
@@ -573,6 +573,81 @@ func (rf *Raft) doHeartBeat() {
 				}
 			}(i)
 		}
+	}
+}
+
+// 注意尽管sendNewCommandToAll()函数和doHeartBeat()两个函数功能实际上非常相似，但是还是需要注意
+// 本接口专门用作当客户端发送过来一个kv操作请求，kvserver将该请求发送给集群内其他服务器的场景下
+// 所以两个函数本质上是有点不通用的，
+// 首先关注两个点SendNewCommandToAll（）主要是更新客户端发送过来的新command信息，leader首先保证集群节点都知道这个请求，会将数据发送过去也就是论文中的appendLog操作（大概就是这个意思把记不太清楚了），并保证集群大部分人都接收到后就commitIndex自增1.（注意这个自增1是确定的，本函数功能就将一条kv操作请求同步）
+// 而doHeartBeat（）函数主要功能是将同步leader和集群其他节点中的nextIndex进度和commitIndex进度的，毕竟leader不可能一当选就一定确定他有的log是最多的，所以会统计一下集群的整个进度，同步日志最新的会先提交 -apply操作
+func (rf *Raft) SendNewCommandToAll() {
+	fmt.Printf("[Node %v] is sending new command to others\n", rf.me)
+	commitNum := 1
+	commitNumLock := sync.Mutex{}
+	oldCommit := rf.CommitIndex
+	for server := range rf.peers {
+		if server == int(rf.me) {
+			continue
+		}
+		go func(peer int) {
+			prevterm := int64(0)
+			if rf.nextIndex[peer]-1 > 0 {
+				prevterm = int64(rf.Log[rf.nextIndex[peer]-1].Term)
+			}
+			entry := make([]*LogEntry, len(rf.Log[rf.nextIndex[peer]:]))
+			copy(entry, rf.Log[rf.nextIndex[peer]:])
+			args := &AppendEntriesArgs{
+				Term:         int64(rf.CurrentTerm),
+				LeaderId:     int64(rf.me),
+				LeaderCommit: int64(rf.CommitIndex),
+				PrevLogIndex: int64(rf.nextIndex[peer] - 1),
+				PrevLogTerm:  prevterm,
+				Entries:      entry,
+			}
+
+			fmt.Printf("[Node %v] the ENTRY with prevlogIndex %v for Node %v\n", rf.me, args.PrevLogIndex, peer)
+
+			reply, succ := rf.SendAppendEntries(peer, args)
+			if succ {
+
+				if reply.GetTerm() > int64(rf.CurrentTerm) {
+					rf.mu.Lock()
+					rf.CurrentTerm = int(reply.GetTerm())
+					rf.Character = Follower
+					rf.election_timeout.Reset(RandElectionTimeout())
+					rf.VotedFor = -1
+					rf.mu.Unlock()
+					return
+				}
+				if reply.Success {
+					rf.mu.Lock()
+					rf.matchIndex[peer] = int(args.PrevLogIndex + int64(len(args.Entries)))
+					rf.nextIndex[peer] = rf.matchIndex[peer] + 1
+					fmt.Printf("[Node %v] update %v nextIndex and matchIndex to %v %v,and rf.commitIndex is %v，old is %v\n", rf.me, peer, rf.nextIndex[peer], rf.matchIndex[peer], rf.CommitIndex, oldCommit)
+					commitNumLock.Lock()
+					commitNum++
+					//这里的两个条件第一个用作幂等性，防止多次执行导致commitindex不断变大，本函数只会commitindex自增一次
+					//第二个条件自然是协商集群大部分，commitIndex自增的条件啦
+					if rf.CommitIndex == oldCommit && commitNum >= (len(rf.peers)+1)/2 {
+						rf.CommitIndex++
+						fmt.Printf("[Node %v] commit a new command with commitId %v: %+v\n", rf.me, rf.CommitIndex, rf.Log[rf.CommitIndex])
+						rf.apply()
+						rf.doHeartBeat()
+						rf.ResetTimer()
+					}
+					commitNumLock.Unlock()
+					rf.mu.Unlock()
+				} else {
+					rf.mu.Lock()
+					rf.nextIndex[peer]--
+					fmt.Printf("[Node %v] update %v nextIndex to %v\n", rf.me, peer, rf.nextIndex[peer])
+					rf.mu.Unlock()
+				}
+			} else {
+				fmt.Printf("[Node %v] lost the connection with %v\n", rf.me, peer)
+			}
+		}(server)
 	}
 }
 
@@ -676,6 +751,7 @@ func (rf *Raft) Exec(op string, key string, value int64) (int, int, bool) {
 	isLeader := rf.IsLeader()
 	if isLeader {
 		//leader负责将从文件服务器发送过来的操作信息封装成kv数据库操作command结构
+		rf.mu.Lock()
 		term = rf.CurrentTerm
 		index = len(rf.Log)
 		rf.Log = append(rf.Log, &LogEntry{
@@ -685,7 +761,10 @@ func (rf *Raft) Exec(op string, key string, value int64) (int, int, bool) {
 			Key:   key,
 			Value: int32(value),
 		})
-		rf.doHeartBeat()
+		rf.SendNewCommandToAll()
+		rf.mu.Unlock()
+	} else {
+		fmt.Printf("该节点现在不是leader了")
 	}
 	return index, term, isLeader
 }

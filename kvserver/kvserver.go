@@ -143,13 +143,16 @@ func (kv *KVserver) getReplyChan(index int64) chan OpMsg {
 }
 
 func (kv *KVserver) Exec(ch chan OpMsg, op string, key string, value int64) {
-	fmt.Printf("[Server %v] receive a op request : %v %v", kv.me, op, key)
+	fmt.Printf("[Server %v] receive a op request : %v %v\n", kv.me, op, key)
 
 	index, term, isleader := kv.node.Exec(op, key, value)
+	println("[Server %v] executive this  request")
 	if index != -1 && term != -1 && isleader {
 		kv.mu.Lock()
 		kv.chanmap[index] = ch
 		kv.mu.Unlock()
+	} else if isleader == false {
+		fmt.Printf("该节点现在不是leader了\n")
 	}
 }
 

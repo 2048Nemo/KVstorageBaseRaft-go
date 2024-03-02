@@ -100,7 +100,7 @@ func (s *KVService) Get(key string) (int, error) {
 			if s.servers[i].IsLeader() {
 				s.mu.Lock()
 				s.clientnum++
-				fmt.Printf("[DBService] clientnum is %v", s.clientnum)
+				fmt.Printf("[DBService] clientnum is %v\n", s.clientnum)
 				s.mu.Unlock()
 				s.servers[i].Exec(channel, "get", key, 0)
 				find = true
@@ -111,7 +111,7 @@ func (s *KVService) Get(key string) (int, error) {
 	msg := <-channel
 	s.mu.Lock()
 	s.clientnum--
-	fmt.Printf("[DBService] clientnum is %v", s.clientnum)
+	fmt.Printf("[DBService] clientnum is %v\n", s.clientnum)
 	s.mu.Unlock()
 	if !msg.Succ {
 		fmt.Println(msg.Msg)
@@ -122,7 +122,7 @@ func (s *KVService) Get(key string) (int, error) {
 }
 
 func (s *KVService) Put(key string, value int64) error {
-	fmt.Printf("[DBService] receive a put request")
+	fmt.Printf("[DBService] receive a put request\n")
 	channel := make(chan OpMsg)
 	find := false
 	for {
@@ -131,23 +131,23 @@ func (s *KVService) Put(key string, value int64) error {
 		}
 		for i := range s.servers {
 			if s.servers[i].IsLeader() {
-				fmt.Printf("[DBService] find leader %v", i)
+				fmt.Printf("[DBService] find leader %v\n", i)
 				s.mu.Lock()
 				s.clientnum++
-				fmt.Printf("[DBService] clientnum is %v", s.clientnum)
+				fmt.Printf("[DBService] clientnum is %v\n", s.clientnum)
 				s.mu.Unlock()
 				s.servers[i].Exec(channel, "put", key, value)
+				fmt.Printf("[DBService] clientnum is %v\n", s.clientnum)
 				find = true
-				//还是觉得不要在这里break以防服务器产生分区导致短时间内出现两个leader
-				//万一信息发送给了老leader的话，可能会使操作失效
-				//break
+				break
 			}
 		}
 	}
+
 	msg := <-channel
 	s.mu.Lock()
 	s.clientnum--
-	fmt.Printf("[DBService] clientnum is %v", s.clientnum)
+	fmt.Printf("[DBService] clientnum is %v\n", s.clientnum)
 	s.mu.Unlock()
 	if msg.Succ {
 		fmt.Println("DBService finish put operation")
@@ -158,7 +158,7 @@ func (s *KVService) Put(key string, value int64) error {
 }
 
 func (s *KVService) Update(key string, value int64) error {
-	fmt.Printf("[DBService] receive a update request")
+	fmt.Printf("[DBService] receive a update request\n")
 	channel := make(chan OpMsg)
 	find := false
 	for {
@@ -167,10 +167,10 @@ func (s *KVService) Update(key string, value int64) error {
 		}
 		for i := range s.servers {
 			if s.servers[i].IsLeader() {
-				fmt.Printf("[DBService] find leader %v", i)
+				fmt.Printf("[DBService] find leader %v\n", i)
 				s.mu.Lock()
 				s.clientnum++
-				fmt.Printf("[DBService] clientnum is %v", s.clientnum)
+				fmt.Printf("[DBService] clientnum is %v\n", s.clientnum)
 				s.mu.Unlock()
 				s.servers[i].Exec(channel, "update", key, value)
 				find = true
@@ -191,7 +191,7 @@ func (s *KVService) Update(key string, value int64) error {
 }
 
 func (s *KVService) Remove(key string) error {
-	fmt.Printf("[DBService] receive a update request")
+	fmt.Printf("[DBService] receive a update request\n")
 	channel := make(chan OpMsg)
 	find := false
 	for {
@@ -200,10 +200,10 @@ func (s *KVService) Remove(key string) error {
 		}
 		for i := range s.servers {
 			if s.servers[i].IsLeader() {
-				fmt.Printf("[DBService] find leader %v", i)
+				fmt.Printf("[DBService] find leader %v\n", i)
 				s.mu.Lock()
 				s.clientnum++
-				fmt.Printf("[DBService] clientnum is %v", s.clientnum)
+				fmt.Printf("[DBService] clientnum is %v\n", s.clientnum)
 				s.mu.Unlock()
 				s.servers[i].Exec(channel, "delete", key, 0)
 				find = true
@@ -231,9 +231,8 @@ func (s *KVService) Close() error {
 	for {
 		s.mu.Lock()
 		if s.clientnum == 0 {
-			fmt.Printf("[DBService] can Close now")
+			fmt.Printf("[DBService] can Close now\n")
 			s.closed = true
-			s.mu.Unlock()
 			break
 		}
 		s.mu.Unlock()

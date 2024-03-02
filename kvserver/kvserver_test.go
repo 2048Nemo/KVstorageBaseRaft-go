@@ -42,7 +42,6 @@ func TestSend3Command(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		server := NewKVServer(i, peers, addrs, "./temp")
 		servers[i] = server
-
 	}
 	for i := 0; i < 3; i++ {
 		servers[i].Connect()
@@ -154,15 +153,15 @@ func TestSendCommandSimple(t *testing.T) {
 			break
 		}
 	}
-	outtime := time.NewTimer(2 * time.Second)
+	outtime := time.NewTimer(3 * time.Second)
 	select {
 	case msg := <-msgch:
 		if !msg.Succ {
 			t.Fatalf("Fail to apply. Err msg: %v", msg.Msg)
 		}
 		fmt.Printf("1. receive op msg:%+v\n", msg)
-		//case <-outtime.C:
-		//	t.Fatalf("Exec out of time")
+	case <-outtime.C:
+		t.Fatalf("Exec out of time")
 	}
 	op = "find"
 	for {
@@ -204,7 +203,6 @@ func TestSendCommandSimple(t *testing.T) {
 	case <-outtime.C:
 		t.Fatalf("Exec out of time")
 	}
-
 }
 
 func TestServiceGet(t *testing.T) {
@@ -229,6 +227,12 @@ func TestServiceGet(t *testing.T) {
 	if value != 1 {
 		t.Fatal("get a wrong value")
 	}
-	db.Remove("b")
-	db.Close()
+	err = db.Remove("b")
+	if err != nil {
+		panic(err)
+	}
+	//err = db.Close()
+	//if err != nil {
+	//	panic(err)
+	//}
 }
