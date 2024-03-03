@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"github.com/pkg/errors"
 	"google.golang.org/grpc"
+	"log"
 	"net"
 	"os"
+	"reflect"
 	"sync"
 )
 
@@ -171,7 +173,11 @@ func (kv *KVserver) close() error {
 
 	err = kv.lis.Close()
 	if err != nil {
-		panic(err)
+		if reflect.TypeOf(err) == reflect.TypeOf(&net.OpError{}) {
+			log.Printf("Error closing listener: %v", err)
+		} else {
+			panic(err)
+		}
 	}
 	err = kv.persist()
 	if err != nil {
@@ -185,14 +191,16 @@ func (kv *KVserver) persist() error {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Printf("[Server %v] 's storage is %+v\n", kv.me, kv.storage)
-	file, err := os.OpenFile(kv.filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+	fmt.Printf("[Server %v] 's storage is %v\n", kv.me, kv.storage)
+	//创建文件
+	presistFile, err := os.OpenFile(kv.filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
+	defer presistFile.Close()
 	if err != nil {
-		panic(err)
+		log.Printf("Error opeing file: %v", err)
 	}
-	_, err = file.Write(bytes)
+	_, err = presistFile.Write(bytes)
 	if err != nil {
-		panic(err)
+		log.Printf("Error writing file: %v", err)
 	}
 	return nil
 }

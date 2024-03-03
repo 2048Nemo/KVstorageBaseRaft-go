@@ -148,8 +148,8 @@ func HeartbeatTimeout() time.Duration {
 }
 
 func RandElectionTimeout() time.Duration {
-	//随机选举超时时间 定义随机间隔为 320-420ms
-	timeout := (rand.Intn(100)%100 + 320)
+	//随机选举超时时间 定义随机间隔为 350-550ms
+	timeout := (rand.Intn(200)%200 + 350)
 	//在这里发现时间包中的变量直接乘以整数会爆红，应该转化成int64的值
 	return time.Millisecond * time.Duration(timeout)
 }
@@ -662,6 +662,7 @@ func (rf *Raft) SendAppendEntries(server int, args *AppendEntriesArgs) (*AppendE
 	if succ != nil {
 		fmt.Printf("rpc call AppendEntries failed: %v\n", succ)
 	}
+	<-ctx.Done()
 	return reply, succ == nil
 }
 
@@ -798,9 +799,11 @@ func (rf *Raft) Close() error {
 		if i == rf.me {
 			continue
 		}
-		err := rf.conns[i].Close()
-		if err != nil {
-			panic(err)
+		if rf.conns[i] != nil {
+			err := rf.conns[i].Close()
+			if err != nil {
+				panic(err)
+			}
 		}
 	}
 	return nil

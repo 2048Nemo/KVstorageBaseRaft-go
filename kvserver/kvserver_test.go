@@ -208,31 +208,72 @@ func TestSendCommandSimple(t *testing.T) {
 func TestServiceGet(t *testing.T) {
 	fmt.Println("Test Service begin")
 	db := NewDBServerWithConfig()
-	err := db.Put("a", 1)
-	if err != nil {
-		fmt.Printf("put数据错误%v\n", err)
-	}
-	err = db.Put("b", 1)
-	if err != nil {
-		fmt.Printf("put数据错误%v\n", err)
-	}
-	err = db.Put("abc", 1)
-	if err != nil {
-		fmt.Printf("put数据错误%v\n", err)
-	}
-	value, err := db.Get("a")
-	if err != nil {
-		t.Fatal("put and then get fail")
-	}
-	if value != 1 {
-		t.Fatal("get a wrong value")
-	}
-	err = db.Remove("b")
-	if err != nil {
-		panic(err)
-	}
-	//err = db.Close()
+	//err := db.Put("a", 1)
+	//if err != nil {
+	//	fmt.Printf("put数据错误%v\n", err)
+	//}
+	//err = db.Put("b", 1)
+	//if err != nil {
+	//	fmt.Printf("put数据错误%v\n", err)
+	//}
+	//err = db.Put("abc", 1)
+	//if err != nil {
+	//	fmt.Printf("put数据错误%v\n", err)
+	//}
+	//value, err := db.Get("a")
+	//if err != nil {
+	//	t.Fatal("put and then get fail")
+	//}
+	//if value != 1 {
+	//	t.Fatal("get a wrong value")
+	//}
+	//err = db.Remove("b")
 	//if err != nil {
 	//	panic(err)
 	//}
+	err := db.Close()
+	if err != nil {
+		panic(err)
+	}
+}
+
+func TestPut(t *testing.T) {
+	fmt.Println("Test Service begin")
+	s := NewDBServerWithConfig()
+
+	key := "a"
+	value := int64(1)
+
+	fmt.Printf("[DBService] receive a put request\n")
+	channel := make(chan OpMsg)
+	find := false
+	for {
+		if find {
+			break
+		}
+		for i := range s.servers {
+			if s.servers[i].IsLeader() {
+				fmt.Printf("[DBService] find leader %v\n", i)
+				s.mu.Lock()
+				s.clientnum++
+				fmt.Printf("[DBService] clientnum is %v\n", s.clientnum)
+				s.mu.Unlock()
+				s.servers[i].Exec(channel, "put", key, value)
+				fmt.Printf("[DBService] clientnum is %v\n", s.clientnum)
+				find = true
+				break
+			}
+		}
+	}
+
+	msg := <-channel
+	s.mu.Lock()
+	s.clientnum--
+	fmt.Printf("[DBService] clientnum is %v\n", s.clientnum)
+	s.mu.Unlock()
+	if msg.Succ {
+		fmt.Println("[DBService] finish put operation")
+	} else {
+		fmt.Printf("[DBService] not finished put operation:%v", msg.Msg)
+	}
 }

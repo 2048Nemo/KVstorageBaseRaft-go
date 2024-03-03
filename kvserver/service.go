@@ -3,7 +3,10 @@ package kvserver
 import (
 	"fmt"
 	"gopkg.in/yaml.v3"
+	"io/fs"
+	"log"
 	"os"
+	"reflect"
 	"sync"
 	"time"
 )
@@ -33,45 +36,65 @@ type Config struct {
 	ListenPort    string   `yaml:"listenPort"`
 }
 
+var globalConfigData = []byte(`mode: default
+serversNum: 3
+address:
+- "127.0.0.1"
+- "127.0.0.1"
+- "127.0.0.1"
+port:
+- 10001
+- 10002
+- 10003
+peers:
+- "0"
+- "1"
+- "2"
+persistPath:
+- "./temp/temp1.json"
+- "./temp/temp2.json"
+- "./temp/temp3.json"
+`)
+
 func NewDBServerWithConfig() *KVService {
 	var config Config
-	configdata, err := os.ReadFile("./config.yaml")
+	var configfile *os.File
+	//用作写入初始化的配置文件
+	var configdata []byte
+	configdata, err := os.ReadFile("./temp/config.yaml")
 	if err != nil {
-		config.Mode = "default"
+		//没有配置文件的情况，直接创建一个新的文件并写入默认的配置文件
+		if reflect.TypeOf(err) == reflect.TypeOf(&fs.PathError{}) {
+			//打开文件失败就会创建一个文件
+			configfile, err = os.Create("./temp/config.yaml")
+			if err != nil {
+				log.Fatal(err)
+			}
+			defer configfile.Close()
+			configdata = globalConfigData
+			_, err = configfile.Write(configdata)
+			if err != nil {
+				log.Fatal(err)
+			}
+		}
 	}
 
 	err = yaml.Unmarshal(configdata, &config)
 	if err != nil {
+		fmt.Printf("未解析成功%v", err)
 		panic(err)
 	}
 	num := 0
-	if config.Mode == "default" {
-		// use 3 servers to test
-		num = 3
-	} else {
-		num = config.ServersNum
-	}
-
+	num = config.ServersNum
 	addrs := make([]string, num)
 	peers := make([]int, num)
 	servers := make([]*KVserver, num)
 	persists := make([]string, num)
-	if config.Mode == "default" {
-		addrs[0] = "127.0.0.1:10001"
-		addrs[1] = "127.0.0.1:10002"
-		addrs[2] = "127.0.0.1:10003"
-		peers[0] = 0
-		peers[1] = 1
-		peers[2] = 2
-		persists[0] = "./temp/temp1.json"
-		persists[1] = "./temp/temp2.json"
-		persists[2] = "./temp/temp3.json"
-	} else {
-		for i := 0; i < num; i++ {
-			peers[i] = i
-			addrs[i] = fmt.Sprintf("%v:%v", config.Address[i], config.Port[i])
-			persists[i] = config.PersistPath[i]
-		}
+
+	for i := 0; i < num; i++ {
+		peers[i] = i
+		addrs[i] = fmt.Sprintf("%v:%v", config.Address[i], config.Port[i])
+		persists[i] = config.PersistPath[i]
 	}
 
 	for i := 0; i < num; i++ {
@@ -150,9 +173,9 @@ func (s *KVService) Put(key string, value int64) error {
 	fmt.Printf("[DBService] clientnum is %v\n", s.clientnum)
 	s.mu.Unlock()
 	if msg.Succ {
-		fmt.Println("DBService finish put operation")
+		fmt.Println("[DBService] finish put operation")
 	} else {
-		fmt.Println(msg.Msg)
+		fmt.Printf("[DBService] not finished put operation:%v", msg.Msg)
 	}
 	return nil
 }
@@ -183,7 +206,7 @@ func (s *KVService) Update(key string, value int64) error {
 	fmt.Printf("[DBService] clientnum is %v\n", s.clientnum)
 	s.mu.Unlock()
 	if msg.Succ {
-		fmt.Println("DBService finish put operation")
+		fmt.Println("DBService finish update operation")
 	} else {
 		fmt.Println(msg.Msg)
 	}
@@ -191,7 +214,7 @@ func (s *KVService) Update(key string, value int64) error {
 }
 
 func (s *KVService) Remove(key string) error {
-	fmt.Printf("[DBService] receive a update request\n")
+	fmt.Printf("[DBService] receive a remove request\n")
 	channel := make(chan OpMsg)
 	find := false
 	for {
@@ -216,7 +239,7 @@ func (s *KVService) Remove(key string) error {
 	fmt.Printf("[DBService] clientnum is %v\n", s.clientnum)
 	s.mu.Unlock()
 	if msg.Succ {
-		fmt.Println("DBService finish put operation")
+		fmt.Println("DBService finish remove operation")
 	} else {
 		fmt.Println(msg.Msg)
 	}
