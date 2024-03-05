@@ -153,6 +153,7 @@ func (kv *KVserver) Exec(ch chan OpMsg, op string, key string, value int64) {
 		kv.mu.Lock()
 		kv.chanmap[index] = ch
 		kv.mu.Unlock()
+
 	} else if isleader == false {
 		fmt.Printf("该节点现在不是leader了\n")
 	}
@@ -194,7 +195,12 @@ func (kv *KVserver) persist() error {
 	fmt.Printf("[Server %v] 's storage is %v\n", kv.me, kv.storage)
 	//创建文件
 	presistFile, err := os.OpenFile(kv.filePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0666)
-	defer presistFile.Close()
+	defer func(presistFile *os.File) {
+		err := presistFile.Close()
+		if err != nil {
+			log.Println(err)
+		}
+	}(presistFile)
 	if err != nil {
 		log.Printf("Error opeing file: %v", err)
 	}
@@ -205,6 +211,6 @@ func (kv *KVserver) persist() error {
 	return nil
 }
 
-func (server *KVserver) IsLeader() bool {
-	return server.node.IsLeader()
+func (kv *KVserver) IsLeader() bool {
+	return kv.node.IsLeader()
 }

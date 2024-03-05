@@ -70,7 +70,12 @@ func NewDBServerWithConfig() *KVService {
 			if err != nil {
 				log.Fatal(err)
 			}
-			defer configfile.Close()
+			defer func(configfile *os.File) {
+				err := configfile.Close()
+				if err != nil {
+					log.Println(err)
+				}
+			}(configfile)
 			configdata = globalConfigData
 			_, err = configfile.Write(configdata)
 			if err != nil {

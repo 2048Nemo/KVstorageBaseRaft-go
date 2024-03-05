@@ -11,7 +11,10 @@ func main() {
 	db := kvserver.NewDBServerWithConfig()
 	go randOp(db)
 	go randOp(db)
-	db.Close()
+	err := db.Close()
+	if err != nil {
+		return
+	}
 }
 
 func randOp(db *kvserver.KVService) {
